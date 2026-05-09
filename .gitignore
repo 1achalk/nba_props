@@ -1,0 +1,9 @@
+.venv/
+data/nba.db
+logs/
+*.pyc
+__pycache__/
+.env
+.env.save
+.env.*
+.DS_Store
