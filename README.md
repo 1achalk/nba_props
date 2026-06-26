@@ -1,180 +1,225 @@
-# NBA Player Props Pipeline
+# NBA Player Props Model
 
-A data pipeline for modeling NBA player props. Pulls game data, box scores, shot data, and odds — stores everything in a local SQLite database you can query and feed into models.
+A from-scratch pipeline and probabilistic model for NBA player prop bets (points,
+rebounds, assists, threes, steals, blocks). It ingests box scores, play-by-play
+defensive data, injury reports, and sportsbook odds into a local SQLite database,
+projects a full outcome distribution for each player/market, and compares the
+model's implied probabilities against book lines to find theoretical edges.
 
-## What this is (and isn't)
+It then **forward-tests those edges honestly** — and the headline result is the
+most important thing in this repository.
 
-**This is:** a foundation. It collects and organizes data so you can build models on top.
+## Headline result: no durable edge
 
-**This is not:** the model itself. Once data is flowing, we build the projection model, calibration pipeline, and bet selection layer as a next step.
+Across **739 forward-tested picks** graded against closing lines, the model's
+**realized edge was −1.0%**, versus a **predicted edge of +11.1%**.
 
----
+In plain terms: the model believed it was finding large mispricings, but once
+those picks were settled against sharp closing lines, the apparent edge
+evaporated. The +11.1% was an artifact of the model disagreeing with the market,
+not of the model being right.
 
-## First-time setup (do this once)
+**That negative result is the point of this project.** Sharp prop markets are
+extremely efficient, and a single-developer model built on public data should be
+expected to lose to the closing line. The value here is not a winning betting
+system — it's the discipline of building a complete, calibrated pipeline,
+forward-testing it without fooling myself, and reporting the result truthfully
+even though it isn't the result I was hoping for. I would rather show a rigorous
+negative finding than a backtest-overfit "edge" that wouldn't survive contact
+with a real book.
 
-### 1. Install Homebrew (Mac package manager)
+See [Evaluation methodology](#evaluation-methodology) for how the numbers are
+computed and why I trust the negative result more than the backtest.
 
-Open **Terminal** (Cmd+Space, type "Terminal"). Paste this and hit Enter:
+## What the project does
+
+1. **Collects data** — historical and daily box scores scraped from
+   Basketball-Reference, team defensive profiles from the pbpstats.com
+   play-by-play API, injury reports, and player prop odds from the
+   SportsGameOdds API. Everything lands in a local SQLite DB.
+2. **Projects minutes** — a positional minutes model that redistributes a team's
+   240 available minutes when players are injured or rested (see below).
+3. **Projects each stat** — a per-minute Bayesian rate is multiplied by projected
+   minutes to produce an expected value *and a full distribution* for every market.
+4. **Prices and compares** — converts distributions into over/under probabilities,
+   compares them to the book's implied probabilities, and ranks the largest
+   disagreements as candidate bets.
+5. **Forward-tests** — logs every pick, grades it once the game settles, and
+   tracks realized vs. predicted edge over time.
+
+## Modeling approach
+
+### Minutes model — positional cascading spillover
+
+[`minutes_model.py`](src/nba_pipeline/minutes_model.py) builds a per-player
+minutes baseline by blending season average, a recent-form window, career
+average, and a prior, weighted by sample size (shrinkage toward the prior when
+data is thin). When players are `OUT`/`DOUBTFUL`, their minutes are freed and
+**redistributed to teammates in the same position bucket** (guards → guards,
+etc.), with overflow cascading league-wide, while respecting realistic per-player
+minute caps. The team total is normalized to 240. Playoff rotations tighten, so a
+player-specific playoff multiplier is applied during the postseason.
+
+### Per-minute Bayesian rate projection
+
+Rather than projecting a counting stat directly, [`stat_model.py`](src/nba_pipeline/stat_model.py)
+projects a **per-minute rate** and scales it by projected minutes. The rate is a
+weighted blend of season, recent, career, and league-prior rates — each weight
+shrunk by how much data backs it — so a player with five games leans on the prior
+while a veteran leans on his own track record. The rate is then adjusted for
+opponent defensive strength (from play-by-play profiles) and, in the postseason,
+for the player's historical regular-season-vs-playoff scoring ratio.
+
+Because props are conditional on the player actually playing, projections use a
+**conditional expectation**: expected minutes are divided by the probability of
+playing, so the distribution reflects "given he plays, here's the outcome," and
+the play probability is applied separately.
+
+### Market-specific distributions
+
+Different stats have different shapes, so each market uses an appropriate
+distribution rather than forcing one everywhere:
+
+| Markets | Distribution | Why |
+|---|---|---|
+| Points, rebounds, assists | **Normal** | Higher-count stats; roughly symmetric around the mean |
+| Threes, steals, blocks | **Negative binomial** | Low-count, over-dispersed (variance > mean); a Poisson would understate the tails |
+
+The negative binomial is parameterized from the projected mean and an empirical
+dispersion estimate, so the tail probabilities — which is where prop value lives —
+reflect each player's actual variance rather than a Poisson assumption.
+
+## Evaluation methodology
+
+The model is judged two ways, and I deliberately trust the second one more.
+
+**Backtesting** ([`backtest_minutes.py`](scripts/backtest_minutes.py),
+[`backtest_points.py`](scripts/backtest_points.py)) replays historical games using
+only data available before each game (point-in-time queries, no leakage) and
+scores projection error. Backtests are useful for catching regressions but are
+easy to overfit, so they are not the verdict.
+
+**Forward-testing** ([`track_edge.py`](scripts/track_edge.py)) is the verdict.
+Every recommended pick is logged before tip-off and graded after settlement. For
+each pick it records the model's predicted edge and, after grading, the
+**realized edge = (win rate − book-implied probability)**. Picks generated before
+a known wrong-side bug fix are filtered out so the clean sample is honest. The
+tracker reports cumulative realized edge per slate; the rule set in advance was
+simple: *if realized edge stabilizes positive over enough slates, the edge is
+real; if it decays toward zero, it isn't.* It decayed toward zero.
+
+This is the discipline the project is meant to demonstrate: pre-commit to a
+falsifiable success criterion, forward-test against closing lines, and accept the
+answer.
+
+## Tech stack
+
+- **Python 3.12**
+- **SQLite** — local store for box scores, schedule, odds, injuries, and the picks log
+- **pandas / NumPy** — data wrangling and feature construction
+- **SciPy** (`scipy.stats`) — normal / negative-binomial / Poisson distributions
+- **BeautifulSoup + lxml** — HTML table parsing for Basketball-Reference box scores
+- **requests + tenacity** — rate-limited, retrying API/scraper clients
+- **python-dotenv** — secret/config management
+
+## Setup
+
+Requires Python 3.12+.
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
+# 1. Clone and enter the repo
+git clone <your-repo-url> nba_props
+cd nba_props
 
-It will ask for your Mac password. After it finishes, it prints "Next steps" — run those two `eval` commands it tells you to. This adds Homebrew to your shell.
-
-### 2. Install Python
-
-```bash
-brew install python@3.12
-```
-
-Verify:
-
-```bash
-python3 --version
-```
-
-You should see `Python 3.12.x`.
-
-### 3. Open the project in VSCode
-
-- Open VSCode
-- File → Open Folder → navigate to `/Users/achalk/Documents/nba_props`
-- When prompted "Do you trust the authors", click Yes
-
-### 4. Install Python extensions in VSCode
-
-Extensions sidebar (Cmd+Shift+X), install:
-- **Python** (by Microsoft)
-- **Pylance** (usually auto-installs)
-
-### 5. Create the virtual environment
-
-Open VSCode's terminal: **Terminal → New Terminal** (or `` Ctrl+` ``). Make sure you're in the project folder (the prompt should show `nba_props`). Run:
-
-```bash
+# 2. Create and activate a virtual environment
 python3 -m venv .venv
-source .venv/bin/activate
-```
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-You'll see `(.venv)` appear in your prompt — that means the virtual environment is active.
-
-### 6. Install dependencies
-
-```bash
+# 3. Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-This installs `nba_api`, `pandas`, `requests`, and everything else. Takes a minute or two.
-
-### 7. Set up your API key
-
-Copy the example config to your real config:
-
-```bash
+# 4. Configure secrets
 cp .env.example .env
+# Open .env and add your SportsGameOdds API key (https://sportsgameodds.com).
+# .env is gitignored — never commit it.
 ```
-
-Open `.env` in VSCode and paste your SportsGameOdds API key. **The .env file is gitignored — never commit it.**
-
-> ⚠️ If you previously shared your key anywhere (chat, email, screenshot), regenerate it at sportsgameodds.com first.
-
-### 8. Tell VSCode about the virtual environment
-
-- Press Cmd+Shift+P
-- Type "Python: Select Interpreter"
-- Choose the one with `.venv` in the path
-
-Now VSCode knows to use this project's Python.
-
----
 
 ## Running the pipeline
 
-Every time you open a new terminal in this project, activate the venv first:
-
 ```bash
-source .venv/bin/activate
-```
-
-### One-time backfill (pull historical data)
-
-```bash
+# One-time historical backfill (rate-limited; takes a while)
 python -m scripts.backfill --seasons 2022-23 2023-24 2024-25 2025-26
-```
 
-This takes 30-60 minutes (rate-limited to be polite to NBA's API). Run once, you're done.
+# Build derived features (run after a backfill or when new games land)
+python -m scripts.build_team_features   # rolling team offense/defense
+python -m scripts.build_rest_features    # rest + travel (team_rest table)
 
-### Daily updates
-
-```bash
+# Daily incremental update (yesterday's results, today's schedule, injuries)
 python -m scripts.daily_update
-```
 
-Pulls yesterday's completed games + today's schedule + injury report. Takes a few minutes.
-
-### Pre-game odds refresh
-
-```bash
+# Refresh current prop odds (run a few times pre-tipoff to track line movement)
 python -m scripts.refresh_odds
+
+# Generate the day's candidate picks
+python -m scripts.daily_picks
+
+# Score realized vs. predicted edge on graded picks
+python -m scripts.track_edge
 ```
 
-Pulls current player prop lines. Run this 2-3 times before tipoff to track line movement.
-
----
-
-## Automating updates (cron)
-
-To run automatically: open Terminal and type `crontab -e`. Add these lines (adjust paths):
-
-```cron
-# Daily update at 3am
-0 3 * * * cd /Users/achalk/Documents/nba_props && /Users/achalk/Documents/nba_props/.venv/bin/python -m scripts.daily_update >> logs/daily.log 2>&1
-
-# Odds refresh at 10am, 2pm, 6pm
-0 10,14,18 * * * cd /Users/achalk/Documents/nba_props && /Users/achalk/Documents/nba_props/.venv/bin/python -m scripts.refresh_odds >> logs/odds.log 2>&1
-```
-
-Save and exit (in vim: `:wq`). The first time, Mac will ask for "Full Disk Access" for cron — grant it in System Settings → Privacy.
-
----
+The SQLite database and any generated reports are created locally on first run.
+They are intentionally **not** committed — the raw data is scraped from
+third-party sources and is not redistributed here; regenerate it with the steps
+above.
 
 ## Project structure
 
 ```
 nba_props/
-├── README.md              # This file
-├── requirements.txt       # Python packages
-├── .env.example          # Template for API keys
-├── .env                  # Your real API keys (gitignored)
-├── .gitignore
-├── src/
-│   └── nba_pipeline/
-│       ├── __init__.py
-│       ├── nba_client.py      # Rate-limited nba_api wrapper
-│       ├── odds_client.py     # SportsGameOdds API client
-│       ├── database.py        # SQLite schema and helpers
-│       ├── travel.py          # Travel/rest feature builder
-│       └── config.py          # Loads .env, paths, constants
-├── scripts/
-│   ├── __init__.py
-│   ├── backfill.py            # Historical data pull
-│   ├── daily_update.py        # Daily incremental update
-│   └── refresh_odds.py        # Odds-only refresh
-├── data/
-│   └── nba.db                 # SQLite database (created on first run)
-└── logs/                      # Log output from cron jobs
+├── README.md
+├── LICENSE                       # MIT
+├── requirements.txt
+├── .env.example                  # Template for API keys (.env is gitignored)
+├── src/nba_pipeline/             # Library
+│   ├── config.py                 # Env/config loading, paths, logging
+│   ├── database.py               # SQLite schema and helpers
+│   ├── nba_client_br.py          # Basketball-Reference box-score scraper
+│   ├── odds_client.py            # SportsGameOdds API client
+│   ├── injury_client.py          # Injury report ingestion
+│   ├── opponent_context.py       # Opponent defensive adjustments
+│   ├── travel.py                 # Travel / rest feature geometry
+│   ├── minutes_model.py          # Positional minutes projection
+│   ├── stat_model.py             # Per-minute Bayesian rate → distributions
+│   ├── points_model.py           # Opponent-adjusted points projection
+│   └── playoff_*.py              # Postseason minutes / rate adjustments
+├── scripts/                      # Runnable entry points
+│   ├── backfill.py               # Historical data pull
+│   ├── daily_update.py           # Daily incremental update
+│   ├── refresh_odds.py           # Odds-only refresh
+│   ├── refresh_injuries.py       # Injury-only refresh
+│   ├── build_team_features.py    # Rolling team offense/defense features
+│   ├── build_rest_features.py    # Rest / travel features (team_rest table)
+│   ├── daily_picks.py            # Candidate bet generation
+│   ├── backtest_*.py             # Historical backtests
+│   ├── compare_models.py         # Model comparison harness
+│   ├── track_edge.py             # Realized-vs-predicted edge tracker
+│   └── generate_report.py        # HTML slate reports
+├── data/                         # SQLite DB (gitignored)
+└── logs/                         # Run logs (gitignored)
 ```
 
----
+## Limitations & honest caveats
 
-## What's next (after data is flowing)
+- **No live edge.** As above, the model does not beat closing lines. Do not bet
+  real money on it.
+- **Public data only.** No proprietary tracking data, no real-time injury feeds
+  faster than the public report.
+- **Single-season-depth features.** Opponent and playoff adjustments are
+  heuristic, not learned, and the sample behind them is modest.
+- **Markets are efficient.** The closing line already incorporates most of what a
+  public model can know; this project is a study in *just how hard* that wall is.
 
-1. **Minutes projection model** — Bayesian blend of season minutes, recent games, matchup adjustments
-2. **Component-level prop projections** — model points = sum of (shot type × make rate × point value), assists/rebounds/threes similarly, output full distributions
-3. **Calibration pipeline** — Brier score, reliability diagrams, log loss tracking
-4. **Bet selection** — fractional Kelly sizing, CLV tracking, line shopping across books
-5. **Daily report** — pre-game writeup of model picks with confidence bands
+## License
 
-These come after the foundation works. Don't skip ahead.
+[MIT](LICENSE) © 2026 Aidan Chalk

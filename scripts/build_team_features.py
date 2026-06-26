@@ -14,11 +14,8 @@ Stored in team_rolling table for fast lookup.
 from __future__ import annotations
 
 import sqlite3
-import sys
 
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from src.nba_pipeline.config import setup_logging, DB_PATH
 

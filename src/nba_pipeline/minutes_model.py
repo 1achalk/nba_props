@@ -1,4 +1,9 @@
-"""Minutes projection model with Cascading Positional Spillover."""
+"""Minutes projection model with Cascading Positional Spillover.
+
+Now includes playoff-aware minutes adjustment: in playoff games, rotations
+tighten, so we apply a per-player multiplier based on their historical
+regular-season-vs-playoff minutes ratio.
+"""
 from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
@@ -7,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from .config import DB_PATH
+from .playoff_minutes import compute_playoff_minutes_adjustment, is_playoff_date
 
 RECENT_WINDOW_GAMES = 10
 MIN_GAMES_FOR_FULL_TRUST = 25
@@ -92,10 +98,21 @@ def _injury_p_play(status: str) -> float:
         "DOUBTFUL":     0.1,
         "QUESTIONABLE": 0.5,
         "PROBABLE":     0.85,
-        "HEALTHY":      1.0,   # On report but expected to play
-    }.get(status, 1.0)          # Not on report at all → assume playing
+        "HEALTHY":      1.0,
+    }.get(status, 1.0)
 
 def get_team_minutes_projection(team_id: int, as_of_date: str, db_path: Path = DB_PATH) -> dict[int, MinutesProjection]:
+    """Project minutes for every player on a team for a single game date.
+
+    Builds each player's baseline (sample-size-weighted blend of season, recent,
+    career, and prior), zeroes out players who are OUT/DOUBTFUL on the injury
+    report, then redistributes their freed minutes to teammates in the same
+    position bucket — with overflow cascading league-wide — while respecting
+    per-player minute caps and normalizing the team total toward 240. Postseason
+    dates apply a per-player playoff tightening multiplier.
+
+    Returns a dict mapping player_id -> MinutesProjection.
+    """
     conn = sqlite3.connect(db_path)
     dt = datetime.fromisoformat(as_of_date.replace("Z", "+00:00")).replace(tzinfo=None)
     s_start = season_start_date(season_for_date(dt))
@@ -106,11 +123,27 @@ def get_team_minutes_projection(team_id: int, as_of_date: str, db_path: Path = D
         WHERE pb.team_id = ? AND g.game_date >= ? AND g.game_date < ?
     """, conn, params=(team_id, s_start, as_of_date))
 
-    injuries = pd.read_sql("SELECT player_id, status_normalized FROM player_injuries", conn).set_index("player_id")["status_normalized"].to_dict()
+    # Only apply injury data if we're projecting for a recent date.
+    as_of_dt = datetime.fromisoformat(as_of_date.replace("Z", "+00:00")).replace(tzinfo=None)
+    injuries = {}
+    inj_row = conn.execute("SELECT MAX(fetched_at) FROM player_injuries").fetchone()
+    if inj_row and inj_row[0]:
+        try:
+            fetched_dt = datetime.fromisoformat(inj_row[0].replace("Z", "+00:00")).replace(tzinfo=None)
+            if abs((fetched_dt - as_of_dt).days) <= 7:
+                injuries = pd.read_sql(
+                    "SELECT player_id, status_normalized FROM player_injuries",
+                    conn
+                ).set_index("player_id")["status_normalized"].to_dict()
+        except (ValueError, AttributeError):
+            pass
 
     team_projections = {}
     target_bucket_mins = {"G": 0.0, "F": 0.0, "C": 0.0}
     player_buckets = {}
+    
+    # Check once if we should apply playoff minutes adjustment
+    apply_playoff = is_playoff_date(as_of_date)
 
     # 1. Establish Baselines & Targets
     for _, row in active_players.iterrows():
@@ -119,12 +152,20 @@ def get_team_minutes_projection(team_id: int, as_of_date: str, db_path: Path = D
         player_buckets[pid] = bucket
         
         baseline = _get_player_baseline(pid, as_of_date, conn)
+        
+        # --- Playoff minutes adjustment ---
+        # In playoffs, rotations tighten: starters play more, bench plays less.
+        # Apply player-specific multiplier based on their playoff history.
+        if apply_playoff:
+            playoff_adj = compute_playoff_minutes_adjustment(pid, as_of_date, conn)
+            if playoff_adj.confidence > 0:
+                baseline["mean"] = baseline["mean"] * playoff_adj.multiplier
+                baseline.setdefault("debug", {})
+                baseline["debug"]["playoff_min_mult"] = round(playoff_adj.multiplier, 3)
+                baseline["debug"]["playoff_n_games"] = playoff_adj.n_playoff
+        
         target_bucket_mins[bucket] += baseline["mean"]
         
-        # p_play is driven purely by injury status.
-        # If a player is not on the injury report, they get p_play=1.0.
-        # This is correct for conditional expectation in prop betting:
-        # props void on DNPs, so we project stats assuming the player plays.
         status = injuries.get(pid, "NOT_LISTED")
         p_play = _injury_p_play(status)
 
@@ -198,12 +239,19 @@ def get_team_minutes_projection(team_id: int, as_of_date: str, db_path: Path = D
     return final_projections
 
 def project_minutes(player_id: int, as_of_date: str = None, db_path: Path = DB_PATH) -> MinutesProjection:
+    """Project minutes for a single player by resolving their team, running the
+    full team-level spillover projection, and returning that player's entry.
+
+    Convenience wrapper over get_team_minutes_projection; falls back to a neutral
+    prior if the player has no prior games on record.
+    """
     if as_of_date is None: as_of_date = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(db_path)
     team_query = conn.execute("""
         SELECT pb.team_id FROM player_box pb JOIN games g ON pb.game_id = g.game_id
-        WHERE pb.player_id = ? ORDER BY g.game_date DESC LIMIT 1
-    """, (player_id,)).fetchone()
+        WHERE pb.player_id = ? AND g.game_date < ?
+        ORDER BY g.game_date DESC LIMIT 1
+    """, (player_id, as_of_date)).fetchone()
     conn.close()
     if not team_query: return MinutesProjection(18.0, 8.0, 0.5, 0, 0, 0, {})
     return get_team_minutes_projection(team_query[0], as_of_date, db_path).get(

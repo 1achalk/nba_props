@@ -35,28 +35,41 @@ def _cached_schedule(season: str) -> pd.DataFrame:
     return fetch_season_games(season)
 
 
-def update_completed_games(target_date: str | None = None) -> None:
+def update_completed_games(target_date: str | None = None, lookback_days: int = 3) -> None:
+    """Pull box scores for games on target_date, OR back-fill the last N days
+    of games not yet in player_box."""
     season = get_current_season()
-    if target_date is None:
-        target_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    logger.info(f"Looking for completed games from {target_date}")
-
     df = _cached_schedule(season)
     if df.empty:
         logger.info(f"No games for season {season}")
         return
-    df_target = df[df["GAME_DATE"] == target_date]
-    if df_target.empty:
-        logger.info(f"No games on {target_date}")
-        return
-    game_ids = df_target["GAME_ID"].unique().tolist()
-    logger.info(f"Ingesting {len(game_ids)} games from {target_date}")
-    for gid in game_ids:
-        try:
-            _ingest_box_score_br(gid)
-            logger.info(f"  ingested {gid}")
-        except Exception as e:
-            logger.error(f"  failed {gid}: {e}")
+    
+    # Build list of dates to check
+    if target_date:
+        dates_to_check = [target_date]
+    else:
+        # Look back N days from yesterday
+        today = datetime.now()
+        dates_to_check = [
+            (today - timedelta(days=d)).strftime("%Y-%m-%d")
+            for d in range(1, lookback_days + 1)
+        ]
+    
+    logger.info(f"Checking dates: {dates_to_check}")
+    
+    for d in dates_to_check:
+        df_target = df[df["GAME_DATE"] == d]
+        if df_target.empty:
+            logger.info(f"  No games on {d}")
+            continue
+        game_ids = df_target["GAME_ID"].unique().tolist()
+        logger.info(f"  Ingesting up to {len(game_ids)} games from {d}")
+        for gid in game_ids:
+            try:
+                _ingest_box_score_br(gid)
+                logger.info(f"    ingested {gid}")
+            except Exception as e:
+                logger.error(f"    failed {gid}: {e}")
 
 
 def update_today_schedule() -> None:

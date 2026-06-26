@@ -5,7 +5,7 @@ Built from the schedule. NBA arenas are hardcoded with lat/lon.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Iterable
 
 # NBA arena coordinates (lat, lon). Approximate arena locations.

@@ -12,9 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
 from .config import DB_PATH
 from .minutes_model import project_minutes, season_for_date, season_start_date, _shrinkage
@@ -36,6 +34,14 @@ class PointsProjection:
     opp_context: dict
 
 def project_points(player_id: int, as_of_date: str = None, game_id: str = None, db_path: Path = DB_PATH) -> PointsProjection:
+    """Project a player's points distribution for one game (v1 baseline model).
+
+    Multiplies conditional projected minutes by a sample-size-weighted
+    points-per-minute estimate and an opponent-defense multiplier, with a simple
+    proportional standard deviation. Retained as the v1 baseline that the generic
+    stat_model.project_stat (normal/negative-binomial distributions) is
+    benchmarked against in compare_models.py and backtest_points.py.
+    """
     if as_of_date is None:
         as_of_date = datetime.now().strftime("%Y-%m-%d")
         
@@ -98,12 +104,11 @@ def project_points(player_id: int, as_of_date: str = None, game_id: str = None, 
                     "pace": opp_ctx.pace,
                     "pts_adj": opp_ctx.pts_adj
                 }
-        except Exception as e:
+        except Exception:
             pass # Fallback to 1.0 if opponent data is missing
 
     conn.close()
 
-    # 4) Final Math: Expected = Minutes * PPM * Matchup Multiplier
     # 4) Final Math: Conditional Expectation
     # Sportsbook bets void if the player doesn't play. We must project their stats 
     # based ONLY on the minutes they play given they are active.

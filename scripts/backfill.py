@@ -12,8 +12,8 @@ from tqdm import tqdm
 from src.nba_pipeline.config import setup_logging
 from src.nba_pipeline.database import get_conn, init_db, upsert_many
 from src.nba_pipeline.nba_client_br import (
-    BR_TEAM_MAP, TEAM_ID_BY_ABBR, fetch_box_score, fetch_players,
-    fetch_season_games, fetch_teams,
+    BR_TEAM_MAP, TEAM_ID_BY_ABBR, fetch_box_score, fetch_season_games,
+    fetch_teams,
 )
 
 logger = setup_logging("backfill")

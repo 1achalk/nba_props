@@ -53,6 +53,12 @@ PLAYER_PROP_MARKETS = [
 
 
 class SportsGameOddsClient:
+    """Client for the SportsGameOdds API (player prop lines).
+
+    Reads the API key from the constructor or the SPORTSGAMEODDS_API_KEY env var
+    and raises if neither is set.
+    """
+
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or SPORTSGAMEODDS_API_KEY
         if not self.api_key:

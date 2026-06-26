@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import time
 from io import StringIO
-from typing import Any
 
 import pandas as pd
 import requests
@@ -103,6 +102,12 @@ def _season_to_br_year(season: str) -> int:
 
 
 def fetch_season_games(season: str, season_type: str = "Regular Season"):
+    """Fetch a season's schedule/results from Basketball-Reference.
+
+    Walks the per-month schedule pages, concatenates them, and returns a
+    normalized two-rows-per-game frame (one per team). Only Regular Season is
+    supported. Months with no games yet (404) are skipped.
+    """
     if season_type != "Regular Season":
         logger.warning(f"BR client only supports Regular Season; got {season_type}")
     year = _season_to_br_year(season)
@@ -165,6 +170,9 @@ def _normalize_schedule(df, season):
 
 
 def fetch_box_score(game_id: str):
+    """Fetch a single game's box score page, returning the raw HTML and all
+    parsed tables. `game_id` must be the "YYYYMMDD-AWAY-HOME" form this client emits.
+    """
     parts = game_id.split("-")
     if len(parts) != 3:
         raise ValueError(f"Unexpected game_id: {game_id}")
@@ -177,14 +185,24 @@ def fetch_box_score(game_id: str):
 
 
 def fetch_shot_chart(game_id: str, season: str):
+    """Shot-chart stub. Basketball-Reference does not expose per-shot data the way
+    the old nba_api source did, so this returns an empty frame to preserve the
+    interface expected by callers.
+    """
     return pd.DataFrame()
 
 
 def fetch_teams():
+    """Return the static list of 30 NBA teams (id, name, abbr, city, ...)."""
     return TEAMS_STATIC
 
 
 def fetch_players():
+    """Fetch the current season's active players from the per-game stats page.
+
+    Returns a list of {id, full_name, is_active}; player ids are stable hashes of
+    the player name (Basketball-Reference has no numeric player id we ingest here).
+    """
     from datetime import datetime
     today = datetime.now()
     year = today.year + 1 if today.month >= 10 else today.year

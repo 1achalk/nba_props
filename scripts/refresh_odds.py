@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 from src.nba_pipeline.config import DB_PATH, setup_logging
 from src.nba_pipeline.database import get_conn, init_db, upsert_many

@@ -8,7 +8,6 @@ from __future__ import annotations
 import sqlite3
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 from src.nba_pipeline.config import DB_PATH
 from src.nba_pipeline.minutes_model import get_team_minutes_projection
@@ -88,7 +87,7 @@ def main():
         # Ask the model for the projection (it will use the mocked injuries and positional buckets)
         try:
             projections = get_team_minutes_projection(tid, game_date, DB_PATH)
-        except Exception as e:
+        except Exception:
             continue
             
         # Compare to actuals

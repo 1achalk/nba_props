@@ -6,7 +6,6 @@ Reports calibration on probability predictions across hypothetical lines.
 """
 from __future__ import annotations
 import sqlite3
-from datetime import datetime
 import numpy as np
 import pandas as pd
 

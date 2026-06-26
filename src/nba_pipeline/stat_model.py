@@ -1,4 +1,9 @@
-"""Generic stat projection with market-aware distributions and conditional expectation."""
+"""Generic stat projection with market-aware distributions and conditional expectation.
+
+Now includes:
+  - Playoff-aware minutes via the upstream minutes_model (already integrated)
+  - Playoff-aware per-minute rate adjustment for points (this module)
+"""
 from __future__ import annotations
 
 import sqlite3
@@ -13,12 +18,12 @@ from scipy.stats import nbinom, norm, poisson
 
 from .config import DB_PATH
 from .minutes_model import (
-    MIN_PLAY_THRESHOLD,
     project_minutes,
     season_for_date,
     season_start_date,
 )
 from .opponent_context import get_opponent_context, get_opponent_for_player_game
+from .playoff_rate import compute_playoff_rate_adjustment
 
 MARKETS = {
     "points":   ("points",     0.50, "normal"),
@@ -46,16 +51,6 @@ class StatProjection:
     rate_debug: dict
 
     def p_over(self, line: float) -> float:
-        """P(stat > line AND player plays).
-
-        Props void on DNP — the bet neither wins nor loses.
-        So the true win probability for an 'over' bet is:
-            P(plays) * P(stat > line | plays)
-
-        self.expected is already a *conditional* projection (given the player
-        plays), so the distribution parameters reflect the conditional world.
-        We just need to scale the resulting probability by p_play.
-        """
         if self.p_play <= 0:
             return 0.0
         if self.distribution == "normal":
@@ -74,11 +69,6 @@ class StatProjection:
         return self.p_play * cond_p
 
     def p_under(self, line: float) -> float:
-        """P(stat <= line AND player plays).
-
-        Symmetric to p_over. Note p_over + p_under = p_play (not 1.0),
-        because the void outcome (DNP) is the remaining probability.
-        """
         if self.p_play <= 0:
             return 0.0
         if self.distribution == "normal":
@@ -108,12 +98,6 @@ def _nbinom_dist_params(mean: float, var: float) -> dict:
 
 
 def _get_player_team_from_schedule(player_id: int, as_of_date: str, conn: sqlite3.Connection) -> Optional[int]:
-    """Look up a player's team for today's games using the schedule table.
-    
-    Falls back to most recent player_box entry if schedule lookup fails.
-    This is important for projecting today's games before player_box is populated.
-    """
-    # First try: find the player on a team scheduled to play today
     row = conn.execute("""
         SELECT t.team_id FROM teams t
         JOIN schedule s ON (s.home_team_id = t.team_id OR s.away_team_id = t.team_id)
@@ -130,7 +114,6 @@ def _get_player_team_from_schedule(player_id: int, as_of_date: str, conn: sqlite
     if row:
         return int(row[0])
     
-    # Fallback: most recent team from player_box
     row = conn.execute("""
         SELECT pb.team_id FROM player_box pb
         JOIN games g ON pb.game_id = g.game_id
@@ -142,7 +125,6 @@ def _get_player_team_from_schedule(player_id: int, as_of_date: str, conn: sqlite
 
 
 def _get_opponent_team_from_schedule(player_team_id: int, as_of_date: str, conn: sqlite3.Connection) -> Optional[int]:
-    """Find the opponent team for a given team on a given date via the schedule."""
     row = conn.execute("""
         SELECT 
             CASE WHEN home_team_id = ? THEN away_team_id ELSE home_team_id END AS opp_id
@@ -159,12 +141,25 @@ def project_stat(
     market: Market,
     as_of_date: str = None,
     game_id: str = None,
-    opponent_team_id: int = None,  # explicit override, e.g. from daily_picks
+    opponent_team_id: int = None,
     db_path: Path = DB_PATH
 ) -> StatProjection:
+    """Project a full outcome distribution for one player/market on a given date.
+
+    Combines projected minutes (from the minutes model) with a per-minute rate —
+    a sample-size-weighted blend of the player's season, recent, career, and a
+    league prior — then applies opponent-defense and (in the postseason) playoff
+    adjustments. The expected value uses a *conditional* minutes estimate (minutes
+    divided by probability of playing), since props void if the player sits.
+
+    Returns a StatProjection carrying the mean, standard deviation, play
+    probability, and the chosen distribution (normal for pts/reb/ast, negative
+    binomial for threes/steals/blocks) so over/under probabilities can be priced.
+    `as_of_date` bounds all queries to data available before that date (no leakage).
+    """
     if as_of_date is None:
         as_of_date = datetime.now().strftime("%Y-%m-%d")
-        
+
     minutes_proj = project_minutes(player_id, as_of_date, db_path)
     if minutes_proj.expected <= 0.1 or minutes_proj.p_play == 0:
         return StatProjection(market, 0.0, 0.0, 0.0, 0, "normal", {}, {}, {})
@@ -209,8 +204,18 @@ def project_stat(
     expected_rate = (w_season * season_rate + w_recent * recent_rate + 
                      w_career * career_rate + w_prior * prior_rate)
 
+    # --- Playoff rate adjustment (points only, by default) ---
+    # In playoffs, per-minute scoring drops league-wide due to defenses tightening,
+    # pace slowing, and refs swallowing whistles. Apply a player-specific multiplier
+    # based on their historical regular-vs-playoff PPM ratio.
+    playoff_rate_adj = compute_playoff_rate_adjustment(
+        player_id, market, as_of_date, conn
+    )
+    rate_adj_multiplier = playoff_rate_adj.multiplier
+    if playoff_rate_adj.confidence > 0:
+        expected_rate *= rate_adj_multiplier
+
     # --- Opponent Adjustment ---
-    # Priority: explicit opponent_team_id > game_id lookup > schedule-based lookup
     opp_adj = 1.0
     resolved_opp_id = opponent_team_id
 
@@ -221,7 +226,6 @@ def project_stat(
             pass
 
     if resolved_opp_id is None:
-        # Auto-resolve from today's schedule
         try:
             player_team_id = _get_player_team_from_schedule(player_id, as_of_date, conn)
             if player_team_id:
@@ -248,12 +252,12 @@ def project_stat(
     conn.close()
 
     # === CONDITIONAL EXPECTATION ===
-    # Sportsbook props void if the player DNPs. Project stats assuming they play.
     conditional_minutes = minutes_proj.expected / minutes_proj.p_play if minutes_proj.p_play > 0 else 0
     
     expected = expected_rate * conditional_minutes
 
-    all_history = pd.concat([df_season.head(30), df_career.head(20)])
+    history_parts = [d for d in [df_season.head(30), df_career.head(20)] if not d.empty]
+    all_history = pd.concat(history_parts) if history_parts else df_season.head(0)    
     observed_mean = all_history["stat"].mean() if len(all_history) > 0 else expected
     observed_std = all_history["stat"].std(ddof=1) if len(all_history) > 1 else expected * 0.5
     observed_var = observed_std ** 2
@@ -281,5 +285,8 @@ def project_stat(
             "season_rate": round(season_rate, 4), "recent_rate": round(recent_rate, 4),
             "career_rate": round(career_rate, 4), "opp_adj": round(opp_adj, 3),
             "opp_team_id": resolved_opp_id,
+            "playoff_rate_mult": round(rate_adj_multiplier, 3),
+            "playoff_rate_conf": round(playoff_rate_adj.confidence, 2),
+            "playoff_n_games": playoff_rate_adj.n_playoff,
         }
     )

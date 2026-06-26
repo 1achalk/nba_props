@@ -45,14 +45,6 @@ def implied_prob(american_odds: int) -> float:
     return abs(american_odds) / (abs(american_odds) + 100.0)
 
 
-def fair_prob_to_american(p: float) -> int:
-    if p <= 0.001 or p >= 0.999:
-        return 0
-    if p >= 0.5:
-        return int(round(-100 * p / (1 - p)))
-    return int(round(100 * (1 - p) / p))
-
-
 def edge_flag(edge: float) -> str:
     if edge >= EDGE_EXTREME_THRESHOLD:
         return "SKIP"
@@ -66,6 +58,12 @@ def normalize(name: str) -> str:
 
 
 def find_player_id(prop_name: str, conn: sqlite3.Connection) -> Optional[int]:
+    """Resolve a sportsbook player name to our player_id via fuzzy matching.
+
+    Tries three passes in order: exact normalized match, first+last token match
+    (most-games wins ties), then unique last-name match. Returns None if no
+    confident match is found.
+    """
     target = normalize(prop_name)
     rows = conn.execute("""
         SELECT p.player_id, p.full_name, COUNT(pb.game_id) AS games
@@ -104,33 +102,20 @@ def find_player_id(prop_name: str, conn: sqlite3.Connection) -> Optional[int]:
     return None
 
 
-def get_player_team(player_id: int, as_of_date: str, conn: sqlite3.Connection) -> Optional[int]:
-    """Get player's team for today — checks schedule first, falls back to last box score."""
-    # Check if the player's most recent team is scheduled to play today
+def get_player_team(player_id: int, conn: sqlite3.Connection) -> Optional[int]:
+    """Get the player's team from their most recent game's box score.
+
+    The caller checks separately whether that team plays today; here we just
+    resolve the team so an opponent lookup can be attempted.
+    """
     row = conn.execute("""
         SELECT pb.team_id FROM player_box pb
         JOIN games g ON pb.game_id = g.game_id
         WHERE pb.player_id = ?
         ORDER BY g.game_date DESC LIMIT 1
     """, (player_id,)).fetchone()
-    
-    if not row:
-        return None
-    
-    team_id = int(row[0])
-    
-    # Verify this team plays today (from schedule)
-    sched = conn.execute("""
-        SELECT game_id FROM schedule
-        WHERE game_date = ? AND (home_team_id = ? OR away_team_id = ?)
-        LIMIT 1
-    """, (as_of_date, team_id, team_id)).fetchone()
-    
-    if sched:
-        return team_id
-    
-    # Team not in today's schedule — player may have been traded, or team has a day off
-    return team_id  # Still return it so we can attempt an opponent lookup
+
+    return int(row[0]) if row else None
 
 
 def get_opponent_team(player_team_id: int, as_of_date: str, conn: sqlite3.Connection) -> Optional[int]:
@@ -198,7 +183,14 @@ def generate_picks(
     log_picks: bool = True,
     backtest: bool = False,
 ) -> pd.DataFrame:
-    # Ensure picks_log table exists
+    """Generate candidate picks for a date by comparing model probabilities to odds.
+
+    Pulls the latest odds snapshot per player/market/line from mainstream books,
+    projects each player/market with the stat model, keeps the best price per side,
+    and returns rows whose model-vs-book edge clears `min_edge`, sorted by edge.
+    When `log_picks` is set, non-SKIP picks are written to picks_log (replacing
+    today's ungraded picks). When `backtest` is set, actual results are graded inline.
+    """
     init_db()
     
     conn = sqlite3.connect(DB_PATH)
@@ -251,19 +243,28 @@ def generate_picks(
             continue
 
         # Get player's team and check if they play today
-        player_team_id = get_player_team(pid, target_date, conn)
+        player_team_id = get_player_team(pid, conn)
         
         # Team filter check
         if filter_team_ids and player_team_id not in filter_team_ids:
             skipped_team += 1
             continue
-
+        
+        # Skip players whose team isn't scheduled to play today
+        if player_team_id:
+            playing_today = conn.execute("""
+                SELECT 1 FROM schedule
+                WHERE game_date = ? AND (home_team_id = ? OR away_team_id = ?)
+                LIMIT 1
+            """, (target_date, player_team_id, player_team_id)).fetchone()
+            if not playing_today:
+                skipped_no_game += 1
+                continue
+    
         # Find opponent from today's schedule
         opp_id = None
         opp_abbr = None
-        player_abbr = None
         if player_team_id:
-            player_abbr = get_team_abbr(player_team_id, conn)
             opp_id = get_opponent_team(player_team_id, target_date, conn)
             if opp_id:
                 opp_abbr = get_team_abbr(opp_id, conn)
@@ -290,8 +291,12 @@ def generate_picks(
             logger.debug(f"Sanity fail: {pname} {market} pred={proj.expected:.1f} line={line}")
             continue
 
-        model_p_over = proj.p_over(line)
-        model_p_under = 1.0 - model_p_over
+        if proj.p_play > 0:
+            model_p_over = proj.p_over(line) / proj.p_play
+            model_p_under = proj.p_under(line) / proj.p_play
+        else:
+            model_p_over = 0.0
+            model_p_under = 0.0
 
         # Find best odds across books for each side
         best_over_idx = group["over_odds"].idxmax()
@@ -364,6 +369,14 @@ def generate_picks(
 
     if log_picks and rows_to_log:
         log_conn = sqlite3.connect(DB_PATH)
+        # Clear today's existing picks before re-logging — prevents duplicates
+        # from multiple runs per day. Preserves graded results from prior days.
+        deleted = log_conn.execute(
+            "DELETE FROM picks_log WHERE pick_date = ? AND won IS NULL",
+            (target_date,)
+        ).rowcount
+        if deleted:
+            logger.info(f"Cleared {deleted} ungraded picks from prior runs today")
         log_conn.executemany("""
             INSERT INTO picks_log
             (pick_date, generated_at, player_name, player_id, market, side,
@@ -391,6 +404,12 @@ def generate_picks(
 
 
 def check_results(target_date: Optional[str] = None) -> None:
+    """Grade pending logged picks against actual box-score results.
+
+    Finds picks_log rows with no result yet (optionally for one date), looks up
+    the player's actual stat, marks win/loss and profit/loss, and prints running
+    performance stats. Picks whose game has no box score yet are left pending.
+    """
     conn = sqlite3.connect(DB_PATH)
     checked_at = datetime.now(timezone.utc).isoformat()
 
